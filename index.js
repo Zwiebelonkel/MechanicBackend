@@ -1,11 +1,11 @@
 const express = require("express");
-const calendarRoutes = require("./calendar"); // ← require statt import!
+const calendarRoutes = require("./calendar");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const fs = require("fs");
 const path = require("path");
 const rateLimit = require("express-rate-limit");
-const nodemailer = require("nodemailer");
+const fetch = require("node-fetch");
 const { DateTime } = require("luxon");
 const { google } = require("googleapis");
 const { GoogleAuth } = require("google-auth-library");
@@ -13,7 +13,7 @@ const { GoogleAuth } = require("google-auth-library");
 dotenv.config();
 
 const app = express();
-app.set("trust proxy", 1);
+app.set("trust proxy", 1); // wichtig für Render!
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -29,26 +29,42 @@ if (!fs.existsSync(file)) fs.writeFileSync(file, "[]");
 const read = () => JSON.parse(fs.readFileSync(file, "utf8"));
 const write = (data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
 
-// Mail Setup
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: false,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-});
-
+// ========================================
+// 🟢 MAIL mit RESEND (funktioniert auf Render)
+// ========================================
 async function sendMail({ to, subject, text, ics }) {
-  const from = `"${process.env.SHOP_NAME}" <${process.env.SHOP_EMAIL}>`;
-  const msg = { from, to, subject, text };
+  const body = {
+    from: `${process.env.SHOP_NAME} <${process.env.SHOP_EMAIL}>`,
+    to,
+    subject,
+    text,
+  };
+
   if (ics) {
-    msg.alternatives = [
-      { contentType: "text/calendar; method=REQUEST", content: ics },
-    ];
-    msg.attachments = [
-      { filename: "termin.ics", content: ics, contentType: "text/calendar" },
+    body.attachments = [
+      {
+        filename: "termin.ics",
+        content: Buffer.from(ics).toString("base64"),
+      },
     ];
   }
-  return transporter.sendMail(msg);
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    console.error("❌ Fehler beim E-Mail-Versand:", data);
+    throw new Error(data.message || "E-Mail-Versand fehlgeschlagen");
+  }
+
+  console.log("📤 Mail gesendet an", to);
 }
 
 // ICS-Datei
