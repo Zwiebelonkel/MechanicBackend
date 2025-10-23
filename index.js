@@ -1,4 +1,5 @@
 const express = require("express");
+const calendarRoutes = require("./calendar"); // ← require statt import!
 const cors = require("cors");
 const dotenv = require("dotenv");
 const fs = require("fs");
@@ -15,10 +16,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Rate Limit (30 Requests / Minute)
+// Rate Limit
 app.use("/api/", rateLimit({ windowMs: 60 * 1000, max: 30 }));
 
-// Datei-Speicher (JSON)
+// Datei-Speicher
 const dataDir = path.join(__dirname, "data");
 const file = path.join(dataDir, "appointments.json");
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
@@ -49,7 +50,7 @@ async function sendMail({ to, subject, text, ics }) {
   return transporter.sendMail(msg);
 }
 
-// ICS Datei (Fallback für Apple/Outlook)
+// ICS-Datei
 function buildICS({ summary, description, start, end, uid }) {
   const s = DateTime.fromISO(start).toUTC().toFormat("yyyyLLdd'T'HHmmss'Z'");
   const e = DateTime.fromISO(end).toUTC().toFormat("yyyyLLdd'T'HHmmss'Z'");
@@ -74,6 +75,7 @@ function buildICS({ summary, description, start, end, uid }) {
 // Google Calendar Integration
 async function addToCalendar({ summary, description, start, end }) {
   if (!process.env.GCAL_CALENDAR_ID) return;
+
   const auth = new GoogleAuth({
     credentials: {
       client_email: process.env.GCAL_CLIENT_EMAIL,
@@ -81,8 +83,10 @@ async function addToCalendar({ summary, description, start, end }) {
     },
     scopes: ["https://www.googleapis.com/auth/calendar"],
   });
+
   const calendar = google.calendar("v3");
   const client = await auth.getClient();
+
   await calendar.events.insert({
     auth: client,
     calendarId: process.env.GCAL_CALENDAR_ID,
@@ -95,9 +99,10 @@ async function addToCalendar({ summary, description, start, end }) {
   });
 }
 
+// Default Route
 app.get("/", (_, res) => res.send("✅ Werkstatt Backend läuft!"));
 
-// Termin-Endpoint
+// Termin Endpoint
 app.post("/api/appointments", async (req, res) => {
   try {
     const b = req.body;
@@ -112,18 +117,14 @@ app.post("/api/appointments", async (req, res) => {
     const summary = `Werkstatt: ${b.service || "Service"} – ${b.name}`;
     const description = `Kunde: ${b.name}\nE-Mail: ${b.email}\nTelefon: ${
       b.phone || "-"
-    }\nFahrzeug: ${b.car_make || ""} ${b.car_model || ""} (${
-      b.license_plate || "-"
-    })\n\nNotizen: ${b.notes || "-"}`;
+    }\n\nNotizen: ${b.notes || "-"}`;
 
-    // Mail an Werkstatt
     await sendMail({
       to: process.env.SHOP_EMAIL,
       subject: `Neue Termin-Anfrage: ${b.name}`,
       text: `${summary}\n${description}\n\nZeitraum: ${b.start_iso} bis ${b.end_iso}`,
     });
 
-    // ICS + Bestätigung an Kunde
     const ics = buildICS({
       summary,
       description,
@@ -131,6 +132,7 @@ app.post("/api/appointments", async (req, res) => {
       end: b.end_iso,
       uid: id,
     });
+
     await sendMail({
       to: b.email,
       subject: "Termin-Anfrage erhalten",
@@ -138,7 +140,6 @@ app.post("/api/appointments", async (req, res) => {
       ics,
     });
 
-    // Kalender-Eintrag
     await addToCalendar({
       summary,
       description,
@@ -148,10 +149,13 @@ app.post("/api/appointments", async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Fehler:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
+// Kalender-Routen
+app.use("/api/calendar", calendarRoutes);
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server läuft auf Port ${PORT}`));
