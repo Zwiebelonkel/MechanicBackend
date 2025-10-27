@@ -1,21 +1,28 @@
 // calendar.js
 const express = require("express");
 const { google } = require("googleapis");
+const { GoogleAuth } = require("google-auth-library");
 
-const router = express.Router(); // <--- WICHTIG: Router muss zuerst definiert werden!
+const router = express.Router();
 
-router.get("/events", async (req, res) => {
+function getGoogleClient() {
+  return new GoogleAuth({
+    credentials: {
+      client_email: process.env.GCAL_CLIENT_EMAIL,
+      private_key: (process.env.GCAL_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+    },
+    scopes: ["https://www.googleapis.com/auth/calendar.readonly"],
+  });
+}
+
+router.get("/events", async (_req, res) => {
   try {
-    const auth = new google.auth.JWT(
-      process.env.GCAL_CLIENT_EMAIL,
-      null,
-      process.env.GCAL_PRIVATE_KEY.replace(/\\n/g, "\n"),
-      ["https://www.googleapis.com/auth/calendar.readonly"]
-    );
-
-    const calendar = google.calendar({ version: "v3", auth });
+    const auth = getGoogleClient();
+    const calendar = google.calendar("v3");
+    const client = await auth.getClient();
 
     const response = await calendar.events.list({
+      auth: client,
       calendarId: process.env.GCAL_CALENDAR_ID,
       timeMin: new Date().toISOString(),
       maxResults: 50,
@@ -25,19 +32,15 @@ router.get("/events", async (req, res) => {
 
     const events = response.data.items || [];
 
-    // ➕ Blockierte Slots extrahieren
     const blockedSlots = events
       .filter((e) => e.start?.dateTime && e.end?.dateTime)
-      .map((e) => ({
-        start: e.start.dateTime,
-        end: e.end.dateTime,
-      }));
+      .map((e) => ({ start: e.start.dateTime, end: e.end.dateTime }));
 
     res.json({ success: true, events, blockedSlots });
   } catch (error) {
-    console.error("❌ Fehler beim Abrufen der Termine:", error);
+    console.error("❌ Fehler /api/calendar/events:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-module.exports = router; // <--- Exportieren nicht vergessen
+module.exports = router;

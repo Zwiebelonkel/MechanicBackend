@@ -2,25 +2,24 @@ const express = require("express");
 const calendarRoutes = require("./calendar");
 const cors = require("cors");
 const dotenv = require("dotenv");
-const fs = require("fs");
-const path = require("path");
 const rateLimit = require("express-rate-limit");
 const fetch = require("node-fetch");
 const { DateTime } = require("luxon");
 const { google } = require("googleapis");
 const { GoogleAuth } = require("google-auth-library");
+const fs = require("fs");
+const path = require("path");
 
 dotenv.config();
 
 const app = express();
-app.set("trust proxy", 1); // wichtig für Render!
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Rate Limit
 app.use("/api/", rateLimit({ windowMs: 60 * 1000, max: 30 }));
 
-// Datei-Speicher
+// =============== FILE FALLBACK (optional) ===============
 const dataDir = path.join(__dirname, "data");
 const file = path.join(dataDir, "appointments.json");
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
@@ -29,9 +28,20 @@ if (!fs.existsSync(file)) fs.writeFileSync(file, "[]");
 const read = () => JSON.parse(fs.readFileSync(file, "utf8"));
 const write = (data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
 
-// ========================================
-// 🟢 MAIL mit RESEND (funktioniert auf Render)
-// ========================================
+// ==========================================================
+// Google Auth Helper
+function getGoogleClient() {
+  return new GoogleAuth({
+    credentials: {
+      client_email: process.env.GCAL_CLIENT_EMAIL,
+      private_key: (process.env.GCAL_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+    },
+    scopes: ["https://www.googleapis.com/auth/calendar"],
+  });
+}
+
+// ==========================================================
+// Resend Mail
 async function sendMail({ to, subject, text, ics }) {
   const body = {
     from: `${process.env.SHOP_NAME} <${process.env.SHOP_EMAIL}>`,
@@ -59,15 +69,12 @@ async function sendMail({ to, subject, text, ics }) {
   });
 
   const data = await res.json();
-  if (!res.ok) {
-    console.error("❌ Fehler beim E-Mail-Versand:", data);
-    throw new Error(data.message || "E-Mail-Versand fehlgeschlagen");
-  }
-
+  if (!res.ok) throw new Error(data.message || "E-Mail-Versand fehlgeschlagen");
   console.log("📤 Mail gesendet an", to);
 }
 
-// ICS-Datei
+// ==========================================================
+// ICS-Datei Builder
 function buildICS({ summary, description, start, end, uid }) {
   const s = DateTime.fromISO(start).toUTC().toFormat("yyyyLLdd'T'HHmmss'Z'");
   const e = DateTime.fromISO(end).toUTC().toFormat("yyyyLLdd'T'HHmmss'Z'");
@@ -89,37 +96,38 @@ function buildICS({ summary, description, start, end, uid }) {
   ].join("\r\n");
 }
 
-// Google Calendar Integration
-async function addToCalendar({ summary, description, start, end }) {
-  if (!process.env.GCAL_CALENDAR_ID) return;
+// ==========================================================
+// Event zu Google Calendar hinzufügen
+async function addToCalendar({ summary, description, start, end, email }) {
+  if (!process.env.GCAL_CALENDAR_ID) return null;
 
-  const auth = new GoogleAuth({
-    credentials: {
-      client_email: process.env.GCAL_CLIENT_EMAIL,
-      private_key: (process.env.GCAL_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
-    },
-    scopes: ["https://www.googleapis.com/auth/calendar"],
-  });
-
+  const auth = getGoogleClient();
   const calendar = google.calendar("v3");
   const client = await auth.getClient();
 
-  await calendar.events.insert({
+  const response = await calendar.events.insert({
     auth: client,
     calendarId: process.env.GCAL_CALENDAR_ID,
+    sendUpdates: "all",
     requestBody: {
       summary,
       description,
       start: { dateTime: start },
       end: { dateTime: end },
+      attendees: [{ email }],
     },
   });
+
+  console.log("📅 Neuer Google Calendar Eintrag erstellt:", response.data.id);
+  return response.data.id;
 }
 
+// ==========================================================
 // Default Route
-app.get("/", (_, res) => res.send("✅ Werkstatt Backend läuft!"));
+app.get("/", (_, res) => res.send("✅ Werkstatt Backend läuft (Google Sync)"));
 
-// Termin Endpoint
+// ==========================================================
+// POST: Neuer Termin
 app.post("/api/appointments", async (req, res) => {
   try {
     const b = req.body;
@@ -127,20 +135,23 @@ app.post("/api/appointments", async (req, res) => {
       return res.status(400).json({ error: "Pflichtfelder fehlen" });
 
     const id = `apt_${Date.now()}`;
-    const all = read();
-    all.push({ id, ...b });
-    write(all);
-
     const summary = `Werkstatt: ${b.service || "Service"} – ${b.name}`;
     const description = `Kunde: ${b.name}\nE-Mail: ${b.email}\nTelefon: ${
       b.phone || "-"
     }\n\nNotizen: ${b.notes || "-"}`;
 
-    await sendMail({
-      to: process.env.SHOP_EMAIL,
-      subject: `Neue Termin-Anfrage: ${b.name}`,
-      text: `${summary}\n${description}\n\nZeitraum: ${b.start_iso} bis ${b.end_iso}`,
+    const gcal_event_id = await addToCalendar({
+      summary,
+      description,
+      start: b.start_iso,
+      end: b.end_iso,
+      email: b.email,
     });
+
+    // Optional JSON-Backup
+    const all = read();
+    all.push({ id, status: "pending", gcal_event_id, ...b });
+    write(all);
 
     const ics = buildICS({
       summary,
@@ -157,22 +168,133 @@ app.post("/api/appointments", async (req, res) => {
       ics,
     });
 
-    await addToCalendar({
-      summary,
-      description,
-      start: b.start_iso,
-      end: b.end_iso,
-    });
-
-    res.json({ success: true });
+    res.json({ success: true, gcal_event_id });
   } catch (err) {
-    console.error("❌ Fehler:", err);
+    console.error("❌ Fehler beim Erstellen:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Kalender-Routen
+// ========================================
+// 📅 ALLE TERMINE LADEN (GET)
+// ========================================
+app.get("/api/appointments", async (req, res) => {
+  try {
+    const auth = getGoogleClient();
+    const calendar = google.calendar("v3");
+    const client = await auth.getClient();
+
+    const response = await calendar.events.list({
+      auth: client,
+      calendarId: process.env.GCAL_CALENDAR_ID,
+      timeMin: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      maxResults: 100,
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+
+    const events = (response.data.items || []).map((e) => {
+      const attendees = e.attendees || [];
+      // 👇 Wir prüfen, was der Shop (Admin) geantwortet hat
+      const shopAttendee = attendees.find(
+        (a) => a.email === process.env.SHOP_EMAIL
+      );
+      const attendeeStatus = shopAttendee?.responseStatus || "needsAction";
+
+      return {
+        id: e.id,
+        summary: e.summary || "Unbenannter Termin",
+        description: e.description || "-",
+        start_iso: e.start?.dateTime || e.start?.date,
+        end_iso: e.end?.dateTime || e.end?.date,
+        attendees: attendees.map((a) => ({
+          email: a.email,
+          responseStatus: a.responseStatus,
+        })),
+        // 👇 Das ist der angezeigte Status im Frontend
+        status: attendeeStatus, // accepted | declined | tentative | needsAction
+      };
+    });
+
+    res.json({ success: true, events });
+  } catch (err) {
+    console.error("❌ Fehler beim Abrufen der Termine:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ==========================================================
+// DELETE: Termin löschen (Google Calendar + JSON)
+app.delete("/api/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const auth = getGoogleClient();
+    const calendar = google.calendar("v3");
+    const client = await auth.getClient();
+
+    await calendar.events.delete({
+      auth: client,
+      calendarId: process.env.GCAL_CALENDAR_ID,
+      eventId: id,
+      sendUpdates: "all",
+    });
+
+    const all = read().filter((a) => a.gcal_event_id !== id);
+    write(all);
+
+    console.log("🗑️ Termin aus Google Calendar gelöscht:", id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Fehler beim Löschen:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ==========================================================
+// PATCH: Status ändern
+app.patch("/api/appointments/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!id || !status)
+      return res
+        .status(400)
+        .json({ success: false, message: "Fehlende Parameter" });
+
+    const auth = getGoogleClient();
+    const calendar = google.calendar("v3");
+    const client = await auth.getClient();
+
+    const event = await calendar.events.get({
+      auth: client,
+      calendarId: process.env.GCAL_CALENDAR_ID,
+      eventId: id,
+    });
+
+    const attendees = event.data.attendees || [];
+    const updated = attendees.map((a) =>
+      a.email === process.env.SHOP_EMAIL ? { ...a, responseStatus: status } : a
+    );
+
+    await calendar.events.patch({
+      auth: client,
+      calendarId: process.env.GCAL_CALENDAR_ID,
+      eventId: id,
+      sendUpdates: "all",
+      requestBody: { attendees: updated },
+    });
+
+    console.log(`✅ Terminstatus geändert: ${id} → ${status}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Fehler beim Status-Update:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ==========================================================
 app.use("/api/calendar", calendarRoutes);
 
+// ==========================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server läuft auf Port ${PORT}`));
