@@ -145,7 +145,7 @@ app.post("/api/appointments", async (req, res) => {
       description,
       start: b.start_iso,
       end: b.end_iso,
-      email: b.email,
+      email: process.env.SHOP_EMAIL,
     });
 
     // Optional JSON-Backup
